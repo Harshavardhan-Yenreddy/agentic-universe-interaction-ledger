@@ -72,52 +72,65 @@ The SQLite database is structured into 5 specialized tables:
 erDiagram
     LEADS ||--o{ INTERACTION_LEDGER : "has interactions"
     LEADS {
-        text workflow_id PK
-        text external_ref PK
-        text phone_hash
-        text customer_name_enc
-        text phone_number_enc
-        text batch_id
-        text metadata_json
+        integer lead_id PK "Primary Key (Auto-increment)"
+        text workflow_id "Composite identity (workflow_id, canonical phone)"
+        text phone_hash "Deterministic HMAC-SHA256 blind index (Unique)"
+        text phone_encrypted "AES-256-GCM ciphertext"
+        text customer_name_encrypted "AES-256-GCM ciphertext"
+        text phone_masked "Masked phone (+91******XXXX)"
+        text external_ref "Schema reference field"
+        text batch_id "Origin batch_id permanently preserved"
+        text policy_expiry "Optional workflow field"
+        text order_date "Optional workflow field"
+        real premium_amount "Optional workflow field"
+        text product "Optional workflow field"
+        text preferred_language "Default 'en'"
         text created_at
         text updated_at
     }
     INTERACTION_LEDGER {
-        text event_id PK
-        text workflow_id FK
-        text external_ref FK
-        text phone_hash
-        text call_id
+        text event_id PK "Primary Key (Unique event identifier)"
+        text drop_id
         text event_type
-        text occurred_at_utc
-        text occurred_at_ist
-        text date_ist
-        text disposition_code
-        text effective_disposition
-        integer is_connected
-        integer is_success
-        integer is_terminal
-        text payload_json
-        text created_at
+        text workflow_id FK
+        text call_id
+        text phone_hash FK "Links to leads via (workflow_id, phone_hash)"
+        text occurred_at_ist "Normalized to IST"
+        text date_ist "YYYY-MM-DD in IST"
+        text payload_json "Sanitized JSON payload without plaintext PII"
+        text ingested_at
     }
     INGESTED_FILES {
-        text file_path PK
-        text file_hash
-        text file_type
-        integer row_count
+        text drop_id PK "Composite PK"
+        text file_path PK "Composite PK"
+        text file_type "leads or events"
+        text file_hash "SHA-256 checksum"
+        integer record_count
         text ingested_at
     }
     REJECTIONS {
-        text workflow_id PK
-        text batch_id PK
-        integer row_number PK
-        text reason
-        text source_file
+        integer id PK "Primary Key (Auto-increment)"
+        text drop_id "Composite Unique with batch_id and row_number"
+        text workflow_id
+        text batch_id
+        integer row_number "1-based non-blank data row"
+        text reason "missing_required:field or invalid_phone"
         text created_at
     }
     DATA_QUALITY {
-        text metric_name PK
-        text metric_value
+        integer id PK "Primary Key (Auto-increment)"
+        text drop_id "Unique drop identifier"
+        integer lead_rows_total
+        integer lead_rows_rejected
+        text rejections_by_reason_json
+        integer duplicate_lead_rows_merged
+        integer field_warnings
+        integer events_total
+        integer malformed_events
+        integer duplicate_events_dropped
+        integer orphan_events
+        integer unknown_disposition_events
+        text created_at
         text updated_at
     }
 ```
@@ -126,16 +139,16 @@ erDiagram
 To guarantee audit compliance, the `interaction_ledger` table prohibits modifications and deletions at the database engine level via SQLite triggers:
 
 ```sql
-CREATE TRIGGER IF NOT EXISTS trg_interaction_ledger_no_update
+CREATE TRIGGER IF NOT EXISTS prevent_interaction_ledger_update
 BEFORE UPDATE ON interaction_ledger
 BEGIN
-    SELECT RAISE(FAIL, 'interaction_ledger is append-only: updates are prohibited');
+    SELECT RAISE(FAIL, 'interaction_ledger is append-only: UPDATE operations are strictly prohibited');
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_interaction_ledger_no_delete
+CREATE TRIGGER IF NOT EXISTS prevent_interaction_ledger_delete
 BEFORE DELETE ON interaction_ledger
 BEGIN
-    SELECT RAISE(FAIL, 'interaction_ledger is append-only: deletes are prohibited');
+    SELECT RAISE(FAIL, 'interaction_ledger is append-only: DELETE operations are strictly prohibited');
 END;
 ```
 
@@ -172,14 +185,16 @@ The pipeline follows a zero-plaintext-PII architecture:
 4. **Row Evaluation & Schema Walk:**
    - Blank rows are skipped without incrementing the row index.
    - For non-blank rows, fields are evaluated strictly in the order they appear in the JSON schema (`motor_renewal.json` or `policy_feedback.json`).
-   - If a required field is missing $\to$ `missing_<field>`.
-   - If a field is malformed $\to$ `invalid_<field>`.
+   - If a required field is missing $\to$ `missing_required:<field_name>`.
+   - If the phone is present but invalid $\to$ `invalid_phone`.
    - The first failing field triggers an immediate rejection row in `rejections.csv`.
    - Non-critical optional field formatting issues record field-level warnings in `data_quality.json`.
-5. **Duplicate Lead Merging:**
-   - If a lead with `(workflow_id, external_ref)` already exists:
+5. **Lead Identity & Duplicate Merging:**
+   - Lead identity is defined as `(workflow_id, canonical phone)` (matched via `phone_hash`).
+   - The first valid row for an identity creates the lead, and its file stem becomes the lead's `batch_id` permanently.
+   - If a lead with identity `(workflow_id, canonical phone)` already exists:
      - The permanent origin `batch_id` from its first valid row is preserved.
-     - Non-null fields from the new row update any previously null optional fields.
+     - Every incoming non-null field overwrites the existing value (last write wins), including previously non-null fields.
      - `duplicate_lead_rows_merged` counter is incremented.
    - If the lead is new, it is inserted into `leads`, and any existing orphan events matching its `(workflow_id, phone_hash)` are immediately linked.
 
@@ -188,11 +203,11 @@ The pipeline follows a zero-plaintext-PII architecture:
 2. **Malformed JSON Handling:** Invalid JSON lines increment `malformed_events` without halting processing.
 3. **Event Deduplication:** Duplicate `event_id` occurrences (within a file or across drops) increment `duplicate_events_dropped` and are skipped.
 4. **Timezone Conversion:** Timestamps in ISO-8601 UTC are converted to Indian Standard Time (`UTC+05:30`), producing `occurred_at_ist` and `date_ist`.
-5. **Disposition Resolution:** Matches `dispositions.csv`. Event `disposition_override` takes precedence over agent disposition. Unrecognized codes increment `unknown_disposition_events`.
+5. **Disposition Resolution:** Matches `dispositions.csv`. A call's effective disposition is the code of its latest valid `disposition.override` by `occurred_at`; if no valid override exists, it uses the latest valid `disposition.set`. Unrecognized disposition codes are counted in `unknown_disposition_events` and ignored.
 6. **Orphan Event Handling:**
-   - Events are matched to leads via `(workflow_id, phone_hash)`.
-   - If no matching lead exists, the event is appended to `interaction_ledger` with `external_ref = NULL` (retained as an orphan event).
-   - When the lead arrives in a later drop (e.g., Drop 2), the lead ingestion process triggers retroactive linking, resolving the orphan events to the new lead.
+   - Events are matched to leads via `(workflow_id, phone_hash)`. A `disposition.override` links through its `call_id` to the lead of that call's other events.
+   - If no matching lead exists, the event is retained in `interaction_ledger` as an orphan interaction and kept out of all reports.
+   - When the corresponding lead arrives in a later drop (e.g., Drop 2), the lead ingestion process triggers retroactive linking, resolving the orphan events to the new lead.
 
 ---
 
@@ -220,7 +235,7 @@ The pipeline generates five reports adhering strictly to the assignment specific
    ```
    - Masked phone format: `+91******XXXX`.
    - `last_call_at` in ISO-8601 IST (`YYYY-MM-DDTHH:MM:SS+05:30`), blank if 0 calls.
-   - `current_disposition` takes effective disposition of the most recent call with a disposition.
+   - `current_disposition` takes effective disposition (latest valid override by occurred_at, else latest valid set) of the most recent call (by initiated time) that has one.
    - `ever_success` is `true`/`false`.
 
 4. **`rejections.csv`** (sorted by `workflow_id, batch_id, row_number`):
@@ -236,10 +251,11 @@ The pipeline generates five reports adhering strictly to the assignment specific
      "lead_rows_total": 2057,
      "lead_rows_rejected": 108,
      "rejections_by_reason": {
-       "missing_customer_name": 14,
-       "invalid_phone_number": 31,
-       "invalid_policy_expiry_date": 23,
-       ...
+       "invalid_phone": 42,
+       "missing_required:customer_name": 25,
+       "missing_required:order_id": 13,
+       "missing_required:phone": 14,
+       "missing_required:policy_number": 14
      },
      "duplicate_lead_rows_merged": 57,
      "field_warnings": 122,

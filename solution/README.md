@@ -242,9 +242,7 @@ The pipeline generates five reports adhering strictly to the assignment specific
        ...
      },
      "duplicate_lead_rows_merged": 57,
-     "field_warnings": {
-       "motor_renewal": { "email": 63, "policy_tenure": 59 }
-     },
+     "field_warnings": 122,
      "events_total": 8745,
      "malformed_events": 8,
      "duplicate_events_dropped": 237,
